@@ -47,8 +47,8 @@
 #define RBUS_DMLNOTIFY_PROVIDER_EVENT_SUFFIX "._RBUS.DML!"
 
 /* Prototypes for NotifyDML internal functions */
-static void _rbusDmlNotify_EnsureProviderEventRegistered(struct _rbusHandle* handleInfo);
 static void _rbusDmlNotify_Publish(rbusHandle_t handle, struct _rbusHandle* handleInfo, char const* kind, char const* path);
+static void _rbusDmlNotify_NotifyAllElementsUnregistered(rbusHandle_t handle, elementNode* node);
 
 //******************************* MACROS *****************************************//
 #define UNUSED1(a)              (void)(a)
@@ -2849,10 +2849,6 @@ rbusError_t rbus_open(rbusHandle_t* handle, char const* componentName)
 
     rbusHandleList_Add(tmpHandle);
 
-    /* Ensure provider publishes internal datamodel change notifications.
-       Do this BEFORE manager create so the namespace exists for wildcard sub. */
-    _rbusDmlNotify_EnsureProviderEventRegistered(tmpHandle);
-
     UnlockMutex();
 
     /* Initialize per-handle dynamic datamodel notification manager (NotifyDML) 
@@ -3067,6 +3063,7 @@ rbusError_t rbus_close(rbusHandle_t handle)
 
     if(handleInfo->elementRoot)
     {
+        _rbusDmlNotify_NotifyAllElementsUnregistered(handle, handleInfo->elementRoot);
         freeElementNode(handleInfo->elementRoot);
         handleInfo->elementRoot = NULL;
     }
@@ -6217,75 +6214,55 @@ rbusError_t rbusHandle_GetTraceContextAsString(
 }
 
 
-static void _rbusDmlNotify_EnsureProviderEventRegistered(struct _rbusHandle* handleInfo)
+static void _rbusDmlNotify_noop_cb(rbusHandle_t h, char const* n, rbusError_t e, rbusObject_t o)
 {
-    if(!handleInfo || !handleInfo->componentName) return;
-
-    char signalName[RBUS_MAX_NAME_LENGTH];
-    char flattenedName[RBUS_MAX_NAME_LENGTH];
-    strncpy(flattenedName, handleInfo->componentName, sizeof(flattenedName)-1);
-    flattenedName[sizeof(flattenedName)-1] = '\0';
-    
-    /* Replace all dots with underscores so the signal is exactly one level below the root. */
-    char* p = flattenedName;
-    while(*p) {
-        if(*p == '.') *p = '_';
-        p++;
-    }
-
-    snprintf(signalName, sizeof(signalName), "%s.%s", RBUS_DML_DISCOVERY_SIGNAL, flattenedName);
-
-    /* We don't call rbus_addElement for the parent 'rbus.dml.discovery' 
-       because it's handled as a prefix. We just register the unique signal. */
-
-    rbusDataElement_t elem = {
-        signalName,
-        RBUS_ELEMENT_TYPE_EVENT,
-        {NULL, NULL, NULL, NULL, NULL, NULL}
-    };
-
-    fprintf(stderr, "dmlnotify: registering unique discovery signal %s for component %s\n", signalName, handleInfo->componentName);
-    rbusError_t rc = rbus_regDataElements((rbusHandle_t)handleInfo, 1, &elem);
-    if(rc != RBUS_ERROR_SUCCESS)
-    {
-        fprintf(stderr, "dmlnotify: FAILED to register unique discovery signal %s, rc=%d\n", signalName, rc);
-    }
+    (void)h; (void)n; (void)e; (void)o;
 }
 
-static void _rbusDmlNotify_Publish(rbusHandle_t handle, struct _rbusHandle* handleInfo, char const* kind, char const* path)
+static void _rbusDmlNotify_Publish(rbusHandle_t handle, struct _rbusHandle* handleInfo,
+                                   char const* kind, char const* path)
 {
     if(!handle || !handleInfo || !handleInfo->componentName || !kind || !path)
         return;
 
-    char signalName[RBUS_MAX_NAME_LENGTH];
-    char flattenedName[RBUS_MAX_NAME_LENGTH];
-    strncpy(flattenedName, handleInfo->componentName, sizeof(flattenedName)-1);
-    flattenedName[sizeof(flattenedName)-1] = '\0';
-    
-    char* p = flattenedName;
-    while(*p) {
-        if(*p == '.') *p = '_';
-        p++;
-    }
+    rbusObject_t params = NULL;
+    rbusObject_Init(&params, NULL);
+    rbusObject_SetPropertyString(params, "kind",     kind);
+    rbusObject_SetPropertyString(params, "path",     path);
+    rbusObject_SetPropertyString(params, "provider", handleInfo->componentName);
 
-    snprintf(signalName, sizeof(signalName), "%s.%s", RBUS_DML_DISCOVERY_SIGNAL, flattenedName);
+    RBUSLOG_INFO("dmlnotify: invoking %s kind=%s path=%s", RBUS_DML_NOTIFYME_METHOD, kind, path);
 
-    rbusEvent_t ev = {0};
-    ev.name = signalName;
-    ev.type = RBUS_EVENT_GENERAL;
-    rbusObject_Init(&ev.data, NULL);
-    rbusObject_SetPropertyString(ev.data, "kind", kind);
-    rbusObject_SetPropertyString(ev.data, "path", path);
-    rbusObject_SetPropertyString(ev.data, "provider", handleInfo->componentName);
-
-    RBUSLOG_INFO("dmlnotify: publishing discovery signal %s for %s", signalName, path);
-    rbusError_t rc = rbusEvent_Publish(handle, &ev);
-    if(rc != RBUS_ERROR_SUCCESS && rc != RBUS_ERROR_NOSUBSCRIBERS)
+    /* Async fire-and-forget: callback is a no-op, so the thread discards the response.
+     * If the manager is not running yet, this fails silently — the initial
+     * state is covered by dmSyncSub at subscription time. */
+    rbusError_t rc = rbusMethod_InvokeAsync(handle, RBUS_DML_NOTIFYME_METHOD, params,
+                                            _rbusDmlNotify_noop_cb, 5);
+    if(rc != RBUS_ERROR_SUCCESS)
     {
-        RBUSLOG_WARN("dmlnotify: failed to publish signal rc=%d", rc);
+        RBUSLOG_DEBUG("dmlnotify: InvokeAsync %s rc=%d (manager may not be running yet)",
+                      RBUS_DML_NOTIFYME_METHOD, rc);
     }
 
-    rbusObject_Release(ev.data);
+    rbusObject_Release(params);
+}
+
+static void _rbusDmlNotify_NotifyAllElementsUnregistered(rbusHandle_t handle, elementNode* node)
+{
+    if(!node) return;
+    
+    // Emit for this node if it's a leaf (property, table, event, method)
+    if(node->fullName && node->type != 0)
+    {
+        _rbusDmlNotify_Publish(handle, (struct _rbusHandle*)handle, "ElementUnregistered", node->fullName);
+    }
+    
+    elementNode* child = node->child;
+    while(child)
+    {
+        _rbusDmlNotify_NotifyAllElementsUnregistered(handle, child);
+        child = child->nextSibling;
+    }
 }
 
 /* End of File */

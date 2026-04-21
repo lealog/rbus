@@ -99,10 +99,6 @@ typedef struct _rbusHandle* rbusHandle_t;
 ///  @brief     The maximum hierarchical depth (e.g. the max token count) a name can be for any element.
 #define RBUS_MAX_NAME_DEPTH 16
 
-/**
- * @brief Global RBUS event topic for dynamic data model discovery signals.
- */
-#define RBUS_DML_DISCOVERY_SIGNAL "rbus.notify.discovery"
 
 ///  @brief     All possible error codes this API can generate.
 typedef enum _rbusError

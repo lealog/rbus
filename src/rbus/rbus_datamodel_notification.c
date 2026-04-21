@@ -28,6 +28,7 @@
 #include <rbuscore.h>
 #include <rbuscore_message.h>
 #include "rbus_log.h"
+#include "rbus_handle.h"
 
 #include <stdbool.h>
 #include <pthread.h>
@@ -39,7 +40,7 @@
 #define VERIFY_NULL_RET(T, R) if((T) == NULL) { return (R); }
 #define ERROR_CHECK(CMD) do { int _e = (CMD); if(_e != 0) { RBUSLOG_ERROR("Error %d:%s running %s", _e, strerror(_e), #CMD); } } while(0)
 
-#define RBUS_DMLNOTIFY_PROVIDER_EVENT_SUFFIX "._RBUS.DML!"
+
 
 typedef struct _dmTok
 {
@@ -90,6 +91,14 @@ typedef struct _dmSub
     uint64_t createdAtMs;
 } dmSub_t;
 
+/* Work item dispatched from RBUS callbacks to dmThread (avoids calling rbusEvent_Subscribe
+ * from within the RBUS dispatch thread, which causes an ABBA deadlock). */
+typedef struct _dmPendingWork {
+    char* kind;     /* "ElementRegistered", "ElementUnregistered", etc. */
+    char* path;     /* element path (owned) */
+    char* provider; /* provider component name (owned, may be NULL) */
+} dmPendingWork_t;
+
 struct _rbusDataModelNotificationManager
 {
     rbusHandle_t handle;
@@ -100,19 +109,18 @@ struct _rbusDataModelNotificationManager
 
     rbusDataModelNotificationHandle_t nextHandle;
     rtVector subs; /* dmSub_t* */
+    rtVector pendingWork; /* dmPendingWork_t* — deferred from RBUS dispatch callbacks */
 
     rbusDataModelNotificationStats_t stats;
-    bool discoverySubscribed;
-    uint64_t lastDiscoveryRetryMs;
-    uint64_t lastSyncAllMs;
-    bool runDiscovery;
-    rtVector boundEvents; /* char* */
 };
 
 static rbusError_t dmBindEvent(rbusDataModelNotificationManager_t mgr, dmSub_t* sub, char const* eventName);
 static void dmOnDiscoverySignal(rbusHandle_t handle, rbusEvent_t const* event, rbusEventSubscription_t* subscription);
 static void dmHandleEvent(rbusHandle_t handle, rbusEvent_t const* eventData, rbusEventSubscription_t* subscription);
 static void dmSyncSub(rbusDataModelNotificationManager_t mgr, dmSub_t* sub);
+static rbusError_t dmNotifyMeHandler(rbusHandle_t handle, char const* methodName,
+                                     rbusObject_t inParams, rbusObject_t outParams,
+                                     rbusMethodAsyncHandle_t asyncHandle);
 
 static void dmPattern_Free(dmPattern_t* p)
 {
@@ -270,6 +278,16 @@ static void dmBinding_Free(void* p)
     if(!b) return;
     free(b->eventName);
     free(b);
+}
+
+static void dmPendingWork_Free(void* p)
+{
+    dmPendingWork_t* w = (dmPendingWork_t*)p;
+    if(!w) return;
+    free(w->kind);
+    free(w->path);
+    free(w->provider);
+    free(w);
 }
 
 static void dmSub_Free(void* p)
@@ -453,42 +471,98 @@ static void dmFlushSub(rbusDataModelNotificationManager_t mgr, dmSub_t* sub)
 static void* dmThread(void* arg)
 {
     rbusDataModelNotificationManager_t mgr = (rbusDataModelNotificationManager_t)arg;
-    
+
     /* Stabilization delay: wait for handle registration and bus to settle. */
     sleep(1);
 
     ERROR_CHECK(pthread_mutex_lock(&mgr->mutex));
     while(mgr->running)
     {
-        /* Expiration cleanup and Background Sync */
+        /* ── Drain pending work from RBUS dispatch callbacks ──────────────────
+         * dmNotifyMeHandler cannot call rbusEvent_Subscribe (it runs in the
+         * RBUS dispatch thread and would deadlock on the RBUS connection mutex).
+         * It pushes items here instead; we process them safely from dmThread. */
+        while(mgr->pendingWork && rtVector_Size(mgr->pendingWork) > 0)
+        {
+            dmPendingWork_t* w = (dmPendingWork_t*)rtVector_At(mgr->pendingWork, 0);
+            rtVector_RemoveItem(mgr->pendingWork, w, NULL); /* detach without free */
+            if(!w) continue;
+
+            bool isCreate = w->kind && (strcmp(w->kind, "ElementRegistered") == 0 ||
+                                        strcmp(w->kind, "RowRegistered") == 0);
+            bool isDel    = w->kind && (strcmp(w->kind, "ElementUnregistered") == 0 ||
+                                        strcmp(w->kind, "RowUnregistered") == 0);
+
+            size_t nSubs = rtVector_Size(mgr->subs);
+            for(size_t si = 0; si < nSubs; si++)
+            {
+                dmSub_t* sub = (dmSub_t*)rtVector_At(mgr->subs, (int)si);
+                if(!sub) continue;
+
+                bool matches = w->path && (dmPattern_Match(&sub->pattern, w->path) ||
+                                           sub->scope == RBUS_DMLNOTIFY_SCOPE_SUBTREE);
+                if(!matches) continue;
+
+                if(isCreate)
+                {
+                    fprintf(stderr, "dmlnotify pendingWork: binding to %s\n", w->path);
+                    /* Unlock before RBUS call (rbusEvent_Subscribe) to prevent
+                     * ABBA deadlock with the RBUS dispatch thread. */
+                    pthread_mutex_unlock(&mgr->mutex);
+                    (void)dmBindEvent(mgr, sub, w->path);
+                    pthread_mutex_lock(&mgr->mutex);
+
+                    if(sub->mask & RBUS_DMLNOTIFY_MASK_OBJECT_CREATION)
+                    {
+                        rbusDataModelNotificationEvent_t ev = {0};
+                        ev.type        = RBUS_DMLNOTIFY_OBJECT_CREATION;
+                        ev.path        = strdup(w->path);
+                        ev.timestampMs = dmNowMs();
+                        dmQueueOrDeliver(mgr, sub, &ev);
+                    }
+                }
+                else if(isDel && (sub->mask & RBUS_DMLNOTIFY_MASK_OBJECT_DELETION))
+                {
+                    rbusDataModelNotificationEvent_t ev = {0};
+                    ev.type        = RBUS_DMLNOTIFY_OBJECT_DELETION;
+                    ev.path        = strdup(w->path);
+                    ev.timestampMs = dmNowMs();
+                    dmQueueOrDeliver(mgr, sub, &ev);
+                }
+            }
+
+            dmPendingWork_Free(w);
+        }
+
+        /* Expiration cleanup and syncPending handling */
         uint64_t nowMs = dmNowMs();
-        for(int i=(int)rtVector_Size(mgr->subs)-1; i>=0; i--)
+        for(int i = (int)rtVector_Size(mgr->subs) - 1; i >= 0; i--)
         {
             dmSub_t* s = (dmSub_t*)rtVector_At(mgr->subs, (size_t)i);
             if(!s) continue;
-            
-            /* Background Sync */
+
             if(s->syncPending)
             {
                 s->syncPending = false;
                 dmSyncSub(mgr, s);
-                /* dmSyncSub may have unlocked/relocked or just taken time, refreshment of 'nowMs' might be good but not critical for cleanup */
             }
 
-            if(s->expirationSeconds && (nowMs - s->createdAtMs) >= (uint64_t)s->expirationSeconds * 1000u)
+            if(s->expirationSeconds &&
+               (nowMs - s->createdAtMs) >= (uint64_t)s->expirationSeconds * 1000u)
             {
                 rtVector_RemoveItem(mgr->subs, s, dmSub_Free);
-                if(mgr->stats.activeSubscriptions) mgr->stats.activeSubscriptions--;
+                if(mgr->stats.activeSubscriptions)
+                    mgr->stats.activeSubscriptions--;
             }
         }
 
-        /* determine next wakeup based on batching windows */
+        /* Determine next wakeup based on pending batch windows */
         rtTime_t now;
         rtTime_Now(&now);
         rtTime_t nextWake = now;
         bool haveWake = false;
 
-        for(size_t i=0;i<rtVector_Size(mgr->subs);i++)
+        for(size_t i = 0; i < rtVector_Size(mgr->subs); i++)
         {
             dmSub_t* s = (dmSub_t*)rtVector_At(mgr->subs, (int)i);
             if(!s || !s->queue || rtVector_Size(s->queue) == 0) continue;
@@ -503,78 +577,10 @@ static void* dmThread(void* arg)
             }
         }
 
-        /* Explicitly discover and subscribe to new provider discovery signals.
-           We do this instead of a wildcard subscription which is unreliable in some environments. */
-        if((nowMs - mgr->lastDiscoveryRetryMs) >= 2000u)
-        {
-            mgr->lastDiscoveryRetryMs = nowMs;
-            
-            int numComps = 0;
-            char** compNames = NULL;
-            if(rbus_discoverWildcardDestinations(RBUS_DML_DISCOVERY_SIGNAL, &numComps, &compNames) == RBUSCORE_SUCCESS)
-            {
-                for(int j=0; j<numComps; j++)
-                {
-                    char signalName[RBUS_MAX_NAME_LENGTH];
-                    char flattenedName[RBUS_MAX_NAME_LENGTH];
-                    strncpy(flattenedName, compNames[j], sizeof(flattenedName)-1);
-                    flattenedName[sizeof(flattenedName)-1] = '\0';
-                    char* p = flattenedName;
-                    while(*p) { if(*p == '.') *p = '_'; p++; }
-
-                    snprintf(signalName, sizeof(signalName), "%s.%s", RBUS_DML_DISCOVERY_SIGNAL, flattenedName);
-                    
-                    /* Check if already bound or check if we can just subscribe again (rbus handles duplicates) */
-                    bool alreadyBound = false;
-                    for(size_t k=0; k<rtVector_Size(mgr->boundEvents); k++)
-                    {
-                        if(strcmp(rtVector_At(mgr->boundEvents, (int)k), signalName) == 0)
-                        {
-                            alreadyBound = true;
-                            break;
-                        }
-                    }
-
-                    if(!alreadyBound)
-                    {
-                        fprintf(stderr, "dmlnotify: explicitly subscribing to discovery signal %s\n", signalName);
-                        if(rbusEvent_Subscribe(mgr->handle, signalName, dmOnDiscoverySignal, mgr, 0) == RBUS_ERROR_SUCCESS)
-                        {
-                            rtVector_PushBack(mgr->boundEvents, strdup(signalName));
-                            fprintf(stderr, "dmlnotify: successfully subscribed to %s\n", signalName);
-                        }
-                    }
-                    free(compNames[j]);
-                }
-                free(compNames);
-            }
-        }
-        
-        /* Periodic background sync as a fallback for push-based discovery.
-           This ensures we eventually find elements even if signals were missed. */
-        if((nowMs - mgr->lastSyncAllMs) >= 2000u)
-        {
-            mgr->lastSyncAllMs = nowMs;
-            /* Use index to avoid issues if subs are added, 
-               and we handle the lock properly in dmSyncSub. */
-            for(size_t i=0; i<rtVector_Size(mgr->subs); i++)
-            {
-                dmSub_t* s = (dmSub_t*)rtVector_At(mgr->subs, (int)i);
-                if(s)
-                {
-                    dmSyncSub(mgr, s);
-                    /* Re-lock because dmSyncSub releases it. 
-                       Wait, dmSyncSub already re-locks it before returning. */
-                }
-            }
-        }
-
         if(!haveWake)
         {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 2;
-            pthread_cond_timedwait(&mgr->cond, &mgr->mutex, &ts);
+            /* No pending batch windows: block until signaled by an incoming event or shutdown. */
+            pthread_cond_wait(&mgr->cond, &mgr->mutex);
             continue;
         }
 
@@ -583,13 +589,14 @@ static void* dmThread(void* arg)
         pthread_cond_timedwait(&mgr->cond, &mgr->mutex, &ts);
 
         rtTime_Now(&now);
-        for(size_t i=0;i<rtVector_Size(mgr->subs);i++)
+        for(size_t i = 0; i < rtVector_Size(mgr->subs); i++)
         {
             dmSub_t* s = (dmSub_t*)rtVector_At(mgr->subs, (int)i);
             if(!s || !s->queue || rtVector_Size(s->queue) == 0) continue;
 
             bool flush = false;
-            if(s->batching.maxBatchSize && rtVector_Size(s->queue) >= s->batching.maxBatchSize)
+            if(s->batching.maxBatchSize &&
+               rtVector_Size(s->queue) >= s->batching.maxBatchSize)
                 flush = true;
             if(s->batching.batchWindowMs)
             {
@@ -747,6 +754,68 @@ static void dmRbusEventHandler2(rbusHandle_t handle, rbusEvent_t const* eventDat
     if(!sub || !sub->mgr)
         return;
     dmHandleEvent(sub->mgr->handle, eventData, subscription);
+}
+
+/* dmNotifyMeHandler: method handler for RBUS_DML_NOTIFYME_METHOD.
+ * Providers call this method (fire-and-forget) when they register or unregister elements.
+ * This replaces the polling-based per-component signal subscription loop. */
+static rbusError_t dmNotifyMeHandler(
+    rbusHandle_t handle,
+    char const* methodName,
+    rbusObject_t inParams,
+    rbusObject_t outParams,
+    rbusMethodAsyncHandle_t asyncHandle)
+{
+    (void)methodName;
+    (void)outParams;
+
+    if(!inParams) goto done;
+
+    rbusValue_t kindV     = rbusObject_GetValue(inParams, "kind");
+    rbusValue_t pathV     = rbusObject_GetValue(inParams, "path");
+    rbusValue_t providerV = rbusObject_GetValue(inParams, "provider");
+
+    char const* kind     = kindV     ? rbusValue_GetString(kindV,     NULL) : NULL;
+    char const* path     = pathV     ? rbusValue_GetString(pathV,     NULL) : NULL;
+    char const* provider = providerV ? rbusValue_GetString(providerV, NULL) : NULL;
+
+    if(!kind || !path) goto done;
+
+    /* Retrieve the manager from the handle's dmlNotifyMgr field. */
+    struct _rbusHandle* handleInfo = (struct _rbusHandle*)handle;
+    if(!handleInfo || !handleInfo->dmlNotifyMgr) goto done;
+
+    rbusDataModelNotificationManager_t mgr =
+        (rbusDataModelNotificationManager_t)handleInfo->dmlNotifyMgr;
+
+    RBUSLOG_INFO("dmlnotify: notifyme: kind=%s path=%s provider=%s",
+                 kind, path, provider ? provider : "unknown");
+    fprintf(stderr, "dmlnotify: notifyme kind=%s path=%s provider=%s\n",
+            kind, path, provider ? provider : "unknown");
+
+    /* Push to pendingWork queue — dmThread will process this outside the RBUS
+     * dispatch context.  Calling rbusEvent_Subscribe (inside dmBindEvent) from
+     * within a RBUS dispatch callback causes an ABBA deadlock between the
+     * RBUS connection mutex and mgr->mutex. */
+    dmPendingWork_t* w = (dmPendingWork_t*)rt_calloc(1, sizeof(dmPendingWork_t));
+    if(w)
+    {
+        w->kind     = strdup(kind);
+        w->path     = strdup(path);
+        w->provider = provider ? strdup(provider) : NULL;
+        ERROR_CHECK(pthread_mutex_lock(&mgr->mutex));
+        rtVector_PushBack(mgr->pendingWork, w);
+        ERROR_CHECK(pthread_cond_signal(&mgr->cond));
+        ERROR_CHECK(pthread_mutex_unlock(&mgr->mutex));
+    }
+
+done:
+    /* Fire-and-forget: send empty success response immediately. */
+    rbusObject_t outObj = NULL;
+    rbusObject_Init(&outObj, NULL);
+    rbusMethod_SendAsyncResponse(asyncHandle, RBUS_ERROR_SUCCESS, outObj);
+    rbusObject_Release(outObj);
+    return RBUS_ERROR_ASYNC_RESPONSE;
 }
 
 static rbusError_t dmBindEvent(rbusDataModelNotificationManager_t mgr, dmSub_t* sub, char const* eventName)
@@ -941,14 +1010,21 @@ static void dmSyncSub(rbusDataModelNotificationManager_t mgr, dmSub_t* sub)
                         if(!alreadyBound)
                         {
                             fprintf(stderr, "dmlnotify sync: matched and binding to %s\n", elemNames[k]);
-                            (void)dmBindEvent(mgr, sub, elemNames[k]);
+                            /* Unlock before rbusEvent_Subscribe to avoid deadlock
+                             * if the RBUS dispatch thread concurrently needs mgr->mutex. */
+                            char pathCopy[RBUS_MAX_NAME_LENGTH];
+                            strncpy(pathCopy, elemNames[k], sizeof(pathCopy) - 1);
+                            pathCopy[sizeof(pathCopy) - 1] = '\0';
+                            pthread_mutex_unlock(&mgr->mutex);
+                            (void)dmBindEvent(mgr, sub, pathCopy);
+                            pthread_mutex_lock(&mgr->mutex);
 
                             /* Explicitly notify the client about the pre-existing path if requested */
                             if(sub->mask & RBUS_DMLNOTIFY_MASK_OBJECT_CREATION)
                             {
                                 rbusDataModelNotificationEvent_t discoveryEv = {0};
                                 discoveryEv.type = RBUS_DMLNOTIFY_OBJECT_CREATION;
-                                discoveryEv.path = strdup(elemNames[k]);
+                                discoveryEv.path = strdup(pathCopy);
                                 discoveryEv.timestampMs = dmNowMs();
                                 dmQueueOrDeliver(mgr, sub, &discoveryEv);
                             }
@@ -973,11 +1049,6 @@ static void dmSyncSub(rbusDataModelNotificationManager_t mgr, dmSub_t* sub)
     RBUSLOG_INFO("dmlnotify sync for sub %u complete", sub->handle);
 }
 
-static void dmSubscribeProviderModelSignals(rbusDataModelNotificationManager_t mgr, dmSub_t* sub, char const* pattern)
-{
-    (void)mgr; (void)sub; (void)pattern;
-    /* Discovery thread handles this periodically */
-}
 
 rbusError_t rbusDataModelNotificationManager_Create(
     rbusHandle_t handle,
@@ -986,7 +1057,8 @@ rbusError_t rbusDataModelNotificationManager_Create(
     VERIFY_NULL_RET(handle, RBUS_ERROR_INVALID_HANDLE);
     VERIFY_NULL_RET(outMgr, RBUS_ERROR_INVALID_INPUT);
 
-    rbusDataModelNotificationManager_t mgr = (rbusDataModelNotificationManager_t)rt_calloc(1, sizeof(*mgr));
+    rbusDataModelNotificationManager_t mgr =
+        (rbusDataModelNotificationManager_t)rt_calloc(1, sizeof(*mgr));
     if(!mgr)
         return RBUS_ERROR_OUT_OF_RESOURCES;
 
@@ -994,7 +1066,7 @@ rbusError_t rbusDataModelNotificationManager_Create(
     mgr->running = 1;
     mgr->nextHandle = 1;
     rtVector_Create(&mgr->subs);
-    rtVector_Create(&mgr->boundEvents);
+    rtVector_Create(&mgr->pendingWork);
 
     pthread_mutexattr_t attrib;
     ERROR_CHECK(pthread_mutexattr_init(&attrib));
@@ -1002,12 +1074,10 @@ rbusError_t rbusDataModelNotificationManager_Create(
     ERROR_CHECK(pthread_mutex_init(&mgr->mutex, &attrib));
     ERROR_CHECK(pthread_cond_init(&mgr->cond, NULL));
 
-    /* NotifyDML manager doesn't need to register the discovery node itself.
-       Each provider registers its own unique signal in rbus_open logic. */
-
     if(pthread_create(&mgr->thread, NULL, dmThread, mgr) != 0)
     {
         rtVector_Destroy(mgr->subs, (void (*)(void*))dmSub_Free);
+        rtVector_Destroy(mgr->pendingWork, dmPendingWork_Free);
         pthread_mutex_destroy(&mgr->mutex);
         pthread_cond_destroy(&mgr->cond);
         free(mgr);
@@ -1015,19 +1085,40 @@ rbusError_t rbusDataModelNotificationManager_Create(
     }
 
     *outMgr = mgr;
+
+    /* Register the manager-owned notifyme method.
+     * Providers call this method (fire-and-forget) whenever they register/unregister
+     * elements. This is fully event-driven — no polling required. */
+    rbusDataElement_t notifyElem = {
+        (char*)RBUS_DML_NOTIFYME_METHOD,
+        RBUS_ELEMENT_TYPE_METHOD,
+        {NULL, NULL, NULL, NULL, NULL, dmNotifyMeHandler}
+    };
+    rbusError_t rc = rbus_regDataElements(handle, 1, &notifyElem);
+    if(rc != RBUS_ERROR_SUCCESS)
+    {
+        RBUSLOG_WARN("dmlnotify: FAILED to register notifyme method rc=%d (non-fatal)", rc);
+        fprintf(stderr, "dmlnotify: FAILED to register notifyme method rc=%d\n", rc);
+    }
+    else
+    {
+        fprintf(stderr, "dmlnotify: registered event-driven method %s\n", RBUS_DML_NOTIFYME_METHOD);
+    }
+
     return RBUS_ERROR_SUCCESS;
 }
 
 void rbusDataModelNotificationManager_Destroy(rbusDataModelNotificationManager_t mgr)
 {
     if(!mgr) return;
-    if(mgr->discoverySubscribed)
-    {
-        char wildcardSignal[RBUS_MAX_NAME_LENGTH];
-        snprintf(wildcardSignal, sizeof(wildcardSignal), "%s.*", RBUS_DML_DISCOVERY_SIGNAL);
-        rbusEvent_Unsubscribe(mgr->handle, wildcardSignal);
-        mgr->discoverySubscribed = false;
-    }
+
+    /* Unregister the manager-owned notifyme method. */
+    rbusDataElement_t notifyElem = {
+        (char*)RBUS_DML_NOTIFYME_METHOD,
+        RBUS_ELEMENT_TYPE_METHOD,
+        {NULL, NULL, NULL, NULL, NULL, NULL}
+    };
+    rbus_unregDataElements(mgr->handle, 1, &notifyElem);
 
     ERROR_CHECK(pthread_mutex_lock(&mgr->mutex));
     mgr->running = 0;
@@ -1035,14 +1126,10 @@ void rbusDataModelNotificationManager_Destroy(rbusDataModelNotificationManager_t
     ERROR_CHECK(pthread_mutex_unlock(&mgr->mutex));
 
     pthread_join(mgr->thread, NULL);
+
     ERROR_CHECK(pthread_mutex_lock(&mgr->mutex));
     if(mgr->subs) rtVector_Destroy(mgr->subs, dmSub_Free);
-    if(mgr->boundEvents)
-    {
-        for(size_t i=0; i<rtVector_Size(mgr->boundEvents); i++)
-            free(rtVector_At(mgr->boundEvents, i));
-        rtVector_Destroy(mgr->boundEvents, NULL);
-    }
+    if(mgr->pendingWork) rtVector_Destroy(mgr->pendingWork, dmPendingWork_Free);
     ERROR_CHECK(pthread_mutex_unlock(&mgr->mutex));
 
     pthread_mutex_destroy(&mgr->mutex);
@@ -1094,8 +1181,6 @@ rbusError_t rbusDataModelNotificationManager_Subscribe(
     /* Bind best-effort: subscribe directly to pattern (works for many RBUS cases, and retries for future paths). */
     fprintf(stderr, "dmlnotify Manager_Subscribe: calling dmBindEvent for %s\n", req->pattern);
     (void)dmBindEvent(mgr, sub, req->pattern);
-    fprintf(stderr, "dmlnotify Manager_Subscribe: calling dmSubscribeProviderModelSignals\n");
-    dmSubscribeProviderModelSignals(mgr, sub, req->pattern);
 
     /* Initial state retrieval: best-effort wildcard getExt, then synthesize ValueChange events. */
     if(req->initialState)

@@ -26,9 +26,13 @@
 
 /**
  * @brief Global RBUS event topic for dynamic data model discovery signals.
- * Providers emit to _RBUS.DML.SIGNAL.DISCOVERY
+ * Providers emit to rbus.notify.discovery.<ComponentName>
  * NotifyDML manager subscribes to this topic for reactive discovery.
  */
+#define RBUS_DML_DISCOVERY_SIGNAL  "rbus.notify.discovery"
+/** Single well-known method registered by the manager; providers invoke it to push
+ *  element registration/unregistration notifications. No polling required. */
+#define RBUS_DML_NOTIFYME_METHOD   "rbus.dml.notifyme()"
 #ifdef __cplusplus
 extern "C" {
 #endif

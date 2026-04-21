@@ -137,6 +137,14 @@ add_executable(rbusDemoDynamicProvider provider/rbusDemoDynamicProvider.c)
 add_dependencies(rbusDemoDynamicProvider rbus)
 target_link_libraries(rbusDemoDynamicProvider rbus)
 
+add_executable(rbusMassProvider provider/rbusMassProvider.c)
+add_dependencies(rbusMassProvider rbus)
+target_link_libraries(rbusMassProvider rbus)
+
+add_executable(rbusStressProvider provider/rbusStressProvider.c)
+add_dependencies(rbusStressProvider rbus)
+target_link_libraries(rbusStressProvider rbus)
+
 install (TARGETS
     rbusSampleProvider
     rbusSampleConsumer
@@ -162,6 +170,8 @@ install (TARGETS
     rbusDataModelNotificationProvider
     rbusDataModelNotificationConsumer
     rbusDemoDynamicProvider
+    rbusMassProvider
+    rbusStressProvider
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 endif (BUILD_RBUS_SAMPLE_APPS)
